@@ -1,11 +1,11 @@
 """Fastest Windows Screen Capture Library For Python 🔥."""
 
-from .windows_capture import (
-    NativeWindowsCapture,
-    NativeCaptureControl,
-    NativeDxgiDuplication,
-    NativeDxgiDuplicationFrame,
-)
+from . import windows_capture as _native
+
+NativeWindowsCapture = _native.NativeWindowsCapture
+NativeCaptureControl = _native.NativeCaptureControl
+NativeDxgiDuplication = getattr(_native, "NativeDxgiDuplication", None)
+NativeDxgiDuplicationFrame = getattr(_native, "NativeDxgiDuplicationFrame", None)
 import ctypes
 import queue
 import threading
@@ -518,6 +518,12 @@ class DxgiDuplicationSession:
     __slots__ = ("_native", "_monitor_index")
 
     def __init__(self, monitor_index: Optional[int] = None) -> None:
+        if NativeDxgiDuplication is None:
+            raise RuntimeError(
+                "DXGI Desktop Duplication is unavailable in this installed binary. "
+                "Reinstall or rebuild windows-capture with a matching windows_capture.pyd."
+            )
+
         self._native = NativeDxgiDuplication(monitor_index)
         self._monitor_index = monitor_index
 
