@@ -42,6 +42,10 @@ capture = WindowsCapture(
     draw_border=None,
     monitor_index=None,
     window_name=None,
+    # direct: callback runs inline on capture thread (lowest copy overhead)
+    # queue: capture thread only enqueues; callback runs on worker thread
+    callback_mode="queue",
+    callback_queue_size=2,
 )
 
 
@@ -64,8 +68,13 @@ def on_closed():
     print("Capture session closed")
 
 
-capture.start()
+capture.start_free_threaded()
 ```
+
+# For keyboard/mouse automation scripts:
+# 1) prefer start_free_threaded() so the main thread can focus on input
+# 2) keep on_frame_arrived lightweight; move heavy work to another queue/worker
+# 3) queue mode may drop old frames under load to keep latency stable
 
 ### DXGI Desktop Duplication API
 
