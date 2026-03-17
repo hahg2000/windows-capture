@@ -241,7 +241,7 @@ class WindowsCapture:
         self._callback_worker_thread: Optional[threading.Thread] = None
         self._callback_worker_stop_event: Optional[threading.Event] = None
         self._capture_stop_requested = threading.Event()
-        self.capture = NativeWindowsCapture(
+        self.capture = self._create_native_capture(
             self.on_frame_arrived,
             self.on_closed,
             cursor_capture,
@@ -253,6 +253,63 @@ class WindowsCapture:
             window_name,
             window_hwnd,
         )
+
+    @staticmethod
+    def _create_native_capture(
+        on_frame_arrived,
+        on_closed,
+        cursor_capture,
+        draw_border,
+        secondary_window,
+        minimum_update_interval,
+        dirty_region,
+        monitor_index,
+        window_name,
+        window_hwnd,
+    ):
+        """Create NativeWindowsCapture with compatibility fallbacks for older .pyd builds."""
+        try:
+            return NativeWindowsCapture(
+                on_frame_arrived,
+                on_closed,
+                cursor_capture,
+                draw_border,
+                secondary_window,
+                minimum_update_interval,
+                dirty_region,
+                monitor_index,
+                window_name,
+                window_hwnd,
+            )
+        except TypeError as first_error:
+            # Older binaries may not expose `window_hwnd` yet.
+            try:
+                return NativeWindowsCapture(
+                    on_frame_arrived,
+                    on_closed,
+                    cursor_capture,
+                    draw_border,
+                    secondary_window,
+                    minimum_update_interval,
+                    dirty_region,
+                    monitor_index,
+                    window_name,
+                )
+            except TypeError:
+                # Even older binaries may not expose `dirty_region` either.
+                try:
+                    return NativeWindowsCapture(
+                        on_frame_arrived,
+                        on_closed,
+                        cursor_capture,
+                        draw_border,
+                        secondary_window,
+                        minimum_update_interval,
+                        monitor_index,
+                        window_name,
+                    )
+                except TypeError:
+                    raise first_error
 
     def _start_callback_worker(self) -> None:
         if self._callback_mode != "queue":
