@@ -1,12 +1,14 @@
 """Fastest Windows Screen Capture Library For Python 🔥."""
 
-from .windows_capture import (
-    NativeWindowsCapture,
-    NativeCaptureControl,
-    NativeDxgiDuplication,
-    NativeDxgiDuplicationFrame,
-)
+from . import windows_capture as _native
+
+NativeWindowsCapture = _native.NativeWindowsCapture
+NativeCaptureControl = _native.NativeCaptureControl
+NativeDxgiDuplication = getattr(_native, "NativeDxgiDuplication", None)
+NativeDxgiDuplicationFrame = getattr(_native, "NativeDxgiDuplicationFrame", None)
 import ctypes
+import queue
+import threading
 import numpy
 import cv2
 import types
@@ -89,14 +91,23 @@ class InternalCaptureControl:
         Stops The Capture Thread
     """
 
-    def __init__(self, stop_list: list) -> None:
+    def __init__(
+        self,
+        stop_list: Optional[list] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> None:
         """Constructs All The Necessary Attributes For The InternalCaptureControl
         Object"""
-        self._stop_list: list = stop_list
+        self._stop_list: Optional[list] = stop_list
+        self._stop_event: Optional[threading.Event] = stop_event
 
     def stop(self) -> None:
         """Stops The Capturing Thread"""
-        self._stop_list[0] = True
+        if self._stop_list is not None:
+            self._stop_list[0] = True
+
+        if self._stop_event is not None:
+            self._stop_event.set()
 
 
 class CaptureControl:
@@ -180,6 +191,8 @@ class WindowsCapture:
         monitor_index: Optional[int] = None,
         window_name: Optional[str] = None,
         window_hwnd: Optional[int] = None,
+        callback_mode: str = "direct",
+        callback_queue_size: int = 2,
     ) -> None:
         """
         Constructs All The Necessary Attributes For The WindowsCapture Object
@@ -205,14 +218,30 @@ class WindowsCapture:
             window_hwnd : int
                 Window Handle (HWND) To Capture - more reliable than window_name
                 for windows with dynamic titles
+            callback_mode : str
+                Callback mode: "direct" (default) or "queue" (non-blocking producer)
+            callback_queue_size : int
+                Max queued frames in queue mode. Older frames are dropped when full.
         """
         # Clear monitor_index if a window target is specified
         if window_name is not None or window_hwnd is not None:
             monitor_index = None
 
+        if callback_mode not in ("direct", "queue"):
+            raise ValueError('callback_mode must be either "direct" or "queue"')
+
+        if callback_queue_size < 1:
+            raise ValueError("callback_queue_size must be >= 1")
+
         self.frame_handler: Optional[types.FunctionType] = None
         self.closed_handler: Optional[types.FunctionType] = None
-        self.capture = NativeWindowsCapture(
+        self._callback_mode = callback_mode
+        self._callback_queue_size = callback_queue_size
+        self._callback_queue: Optional["queue.Queue[Optional[Frame]]"] = None
+        self._callback_worker_thread: Optional[threading.Thread] = None
+        self._callback_worker_stop_event: Optional[threading.Event] = None
+        self._capture_stop_requested = threading.Event()
+        self.capture = self._create_native_capture(
             self.on_frame_arrived,
             self.on_closed,
             cursor_capture,
@@ -225,6 +254,119 @@ class WindowsCapture:
             window_hwnd,
         )
 
+    @staticmethod
+    def _create_native_capture(
+        on_frame_arrived,
+        on_closed,
+        cursor_capture,
+        draw_border,
+        secondary_window,
+        minimum_update_interval,
+        dirty_region,
+        monitor_index,
+        window_name,
+        window_hwnd,
+    ):
+        """Create NativeWindowsCapture with compatibility fallbacks for older .pyd builds."""
+        try:
+            return NativeWindowsCapture(
+                on_frame_arrived,
+                on_closed,
+                cursor_capture,
+                draw_border,
+                secondary_window,
+                minimum_update_interval,
+                dirty_region,
+                monitor_index,
+                window_name,
+                window_hwnd,
+            )
+        except TypeError as first_error:
+            # Older binaries may not expose `window_hwnd` yet.
+            try:
+                return NativeWindowsCapture(
+                    on_frame_arrived,
+                    on_closed,
+                    cursor_capture,
+                    draw_border,
+                    secondary_window,
+                    minimum_update_interval,
+                    dirty_region,
+                    monitor_index,
+                    window_name,
+                )
+            except TypeError:
+                # Even older binaries may not expose `dirty_region` either.
+                try:
+                    return NativeWindowsCapture(
+                        on_frame_arrived,
+                        on_closed,
+                        cursor_capture,
+                        draw_border,
+                        secondary_window,
+                        minimum_update_interval,
+                        monitor_index,
+                        window_name,
+                    )
+                except TypeError:
+                    raise first_error
+
+    def _start_callback_worker(self) -> None:
+        if self._callback_mode != "queue":
+            return
+
+        self._callback_queue = queue.Queue(maxsize=self._callback_queue_size)
+        self._callback_worker_stop_event = threading.Event()
+
+        def worker() -> None:
+            assert self._callback_queue is not None
+            assert self._callback_worker_stop_event is not None
+
+            while not self._callback_worker_stop_event.is_set():
+                try:
+                    frame = self._callback_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                if frame is None:
+                    break
+
+                if self.frame_handler is None:
+                    continue
+
+                control = InternalCaptureControl(stop_event=self._capture_stop_requested)
+                self.frame_handler(frame, control)
+
+        self._callback_worker_thread = threading.Thread(target=worker, daemon=True)
+        self._callback_worker_thread.start()
+
+    def _stop_callback_worker(self) -> None:
+        if self._callback_mode != "queue":
+            return
+
+        if self._callback_worker_stop_event is not None:
+            self._callback_worker_stop_event.set()
+
+        if self._callback_queue is not None:
+            try:
+                self._callback_queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    self._callback_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._callback_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+
+        if self._callback_worker_thread is not None:
+            self._callback_worker_thread.join(timeout=1.0)
+
+        self._callback_worker_thread = None
+        self._callback_worker_stop_event = None
+        self._callback_queue = None
+
     def start(self) -> None:
         """Starts The Capture Thread"""
         if self.frame_handler is None:
@@ -232,6 +374,8 @@ class WindowsCapture:
         elif self.closed_handler is None:
             raise Exception("on_closed Event Handler Is Not Set")
 
+        self._capture_stop_requested.clear()
+        self._start_callback_worker()
         self.capture.start()
 
     def start_free_threaded(self) -> CaptureControl:
@@ -241,11 +385,35 @@ class WindowsCapture:
         elif self.closed_handler is None:
             raise Exception("on_closed Event Handler Is Not Set")
 
+        self._capture_stop_requested.clear()
+        self._start_callback_worker()
         native_capture_control = self.capture.start_free_threaded()
 
         capture_control = CaptureControl(native_capture_control)
 
         return capture_control
+
+    def _enqueue_frame(self, frame: Frame) -> None:
+        if self._callback_queue is None:
+            return
+
+        queued_frame = Frame(frame.frame_buffer.copy(), frame.width, frame.height, frame.timespan)
+
+        try:
+            self._callback_queue.put_nowait(queued_frame)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self._callback_queue.get_nowait()
+        except queue.Empty:
+            return
+
+        try:
+            self._callback_queue.put_nowait(queued_frame)
+        except queue.Full:
+            pass
 
     def on_frame_arrived(
         self,
@@ -259,9 +427,13 @@ class WindowsCapture:
         """This Method Is Called Before The on_frame_arrived Callback Function To
         Prepare Data"""
         if self.frame_handler:
+            if self._capture_stop_requested.is_set():
+                stop_list[0] = True
+                return
+
             internal_capture_control = InternalCaptureControl(stop_list)
 
-            row_pitch = int(buf_len / height)
+            row_pitch = buf_len // height
             if row_pitch == width * 4:
                 ndarray = numpy.ctypeslib.as_array(
                     ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)),
@@ -269,7 +441,10 @@ class WindowsCapture:
                 )
 
                 frame = Frame(ndarray, width, height, timespan)
-                self.frame_handler(frame, internal_capture_control)
+                if self._callback_mode == "queue":
+                    self._enqueue_frame(frame)
+                else:
+                    self.frame_handler(frame, internal_capture_control)
             else:
                 ndarray = numpy.ctypeslib.as_array(
                     ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)),
@@ -277,18 +452,18 @@ class WindowsCapture:
                 )[:, : width * 4].reshape(height, width, 4)
 
                 frame = Frame(ndarray, width, height, timespan)
-                self.frame_handler(frame, internal_capture_control)
-
-                self.frame_handler(
-                    frame,
-                    internal_capture_control,
-                )
+                if self._callback_mode == "queue":
+                    self._enqueue_frame(frame)
+                else:
+                    self.frame_handler(frame, internal_capture_control)
 
         else:
             raise Exception("on_frame_arrived Event Handler Is Not Set")
 
     def on_closed(self) -> None:
         """This Method Is Called Before The on_closed Callback Function"""
+        self._stop_callback_worker()
+
         if self.closed_handler:
             self.closed_handler()
         else:
@@ -400,6 +575,12 @@ class DxgiDuplicationSession:
     __slots__ = ("_native", "_monitor_index")
 
     def __init__(self, monitor_index: Optional[int] = None) -> None:
+        if NativeDxgiDuplication is None:
+            raise RuntimeError(
+                "DXGI Desktop Duplication is unavailable in this installed binary. "
+                "Reinstall or rebuild windows-capture with a matching windows_capture.pyd."
+            )
+
         self._native = NativeDxgiDuplication(monitor_index)
         self._monitor_index = monitor_index
 
